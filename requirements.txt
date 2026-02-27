@@ -1,0 +1,3 @@
+# BotForge Vercel Backend
+# Uses Python standard library only — no pip installs needed.
+# urllib, json, os, traceback are all built-in.
