@@ -1,36 +1,44 @@
 """
 BotForge — Vercel Python Backend
 =================================
-ONLY job: receive Telegram webhook updates and reply to users.
+Jobs:
+  1. GET  /validate-token?token=xxx  — validate bot token (CORS-safe fallback for browser)
+  2. POST /webhook/{token}           — receive Telegram updates, execute commands, reply
+  3. GET  /health                    — health check
 
-Flow:
+Token validation flow:
+  dashboard.php JS → POST /api/validate-token.php  (PHP same server, no CORS)
+    If PHP can't reach Telegram → JS → GET https://your-vercel.app/validate-token?token=xxx
+      → Vercel calls Telegram → returns result to JS
+
+Webhook flow:
   Telegram → POST /webhook/{token}
-    → calls your PHP host to get bot commands
-    → executes command handler code
-    → replies to Telegram user
-
-Does NOT touch MySQL directly.
-Does NOT handle users, payments, plans or any admin logic.
-Those all live in your PHP + MySQL frontend.
+    → GET PHP /api/get-bot-commands.php → execute code → reply to user
 """
 
 from http.server import BaseHTTPRequestHandler
 import json
 import urllib.request
 import urllib.parse
-import urllib.error
 import os
-import traceback
+import re
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# Set these in Vercel Environment Variables dashboard:
-#   PHP_HOST  = https://yoursite.aeonscope.net   (your AeonFree subdomain, no trailing slash)
 PHP_HOST = os.environ.get("PHP_HOST", "").rstrip("/")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def telegram_send(token: str, chat_id: int, text: str) -> dict:
-    """Send a message back to the Telegram user."""
+# ── Telegram ──────────────────────────────────────────────────────────────────
+
+def tg_get(token: str, method: str) -> dict:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    req = urllib.request.Request(url, headers={"User-Agent": "BotForge/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def tg_send(token: str, chat_id: int, text: str) -> dict:
     url  = f"https://api.telegram.org/bot{token}/sendMessage"
     data = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}).encode()
     req  = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
@@ -41,209 +49,166 @@ def telegram_send(token: str, chat_id: int, text: str) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-def get_bot_commands(token: str) -> list:
-    """
-    Ask the PHP host for this bot's commands.
-    PHP file: /api/get-bot-commands.php?token=<token>
-    Returns a list of command dicts with keys:
-      command_name, handler_type, handler_code
-    """
+# ── PHP Bridge ────────────────────────────────────────────────────────────────
+
+def php_get(path: str) -> dict:
     if not PHP_HOST:
-        return []
-    url = f"{PHP_HOST}/api/get-bot-commands.php?token={urllib.parse.quote(token)}"
+        return {}
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "BotForge/1.0"})
+        req = urllib.request.Request(f"{PHP_HOST}{path}", headers={"User-Agent": "BotForge/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read())
-            return data.get("commands", [])
+            return json.loads(r.read())
     except Exception:
-        return []
+        return {}
 
 
-def log_message(token: str, telegram_user_id: int, username: str, message: str, response: str) -> None:
-    """Tell the PHP host to log this message."""
+def php_post(path: str, body: dict) -> dict:
     if not PHP_HOST:
-        return
-    url  = f"{PHP_HOST}/api/log-message.php"
-    body = json.dumps({
-        "token":            token,
-        "telegram_user_id": telegram_user_id,
-        "username":         username,
-        "message":          message,
-        "response":         response,
-    }).encode()
+        return {}
     try:
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-        urllib.request.urlopen(req, timeout=5)
+        data = json.dumps(body).encode()
+        req  = urllib.request.Request(f"{PHP_HOST}{path}", data=data, headers={"Content-Type": "application/json", "User-Agent": "BotForge/1.0"}, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read())
     except Exception:
-        pass
+        return {}
 
 
-def log_error(token: str, command_name: str, error_message: str, telegram_user_id: int) -> None:
-    """Tell the PHP host to log a command error."""
-    if not PHP_HOST:
-        return
-    url  = f"{PHP_HOST}/api/log-error.php"
-    body = json.dumps({
-        "token":            token,
-        "command_name":     command_name,
-        "error_message":    error_message,
-        "telegram_user_id": telegram_user_id,
-    }).encode()
-    try:
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-        urllib.request.urlopen(req, timeout=5)
-    except Exception:
-        pass
+# ── Bot Logic ─────────────────────────────────────────────────────────────────
 
-
-def call_ai(token: str, user_message: str, system_prompt: str = "") -> str:
-    """
-    Ask PHP host to run an AI completion using the admin-configured
-    Gemini / OpenAI / Anthropic key.
-    PHP file: /api/ai-chat.php
-    """
-    if not PHP_HOST:
-        return "AI is not configured."
-    url  = f"{PHP_HOST}/api/ai-chat.php"
-    body = json.dumps({
-        "token":         token,
-        "message":       user_message,
-        "system_prompt": system_prompt,
-    }).encode()
-    try:
-        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read())
-            return data.get("reply", "AI error")
-    except Exception as e:
-        return f"AI unavailable: {str(e)}"
-
-
-def execute_handler(handler_code: str, user_message: str, update: dict) -> str:
-    """
-    Safely execute a command's Python handler_code.
-    The code can set `reply_text` to control the response.
-    Available variables: user_message, update, chat_id, username
-    """
-    msg      = update.get("message", {})
-    chat_id  = msg.get("chat", {}).get("id", 0)
-    username = msg.get("from", {}).get("username", "user")
-    first    = msg.get("from", {}).get("first_name", "there")
-
-    local_vars = {
-        "user_message": user_message,
-        "chat_id":      chat_id,
-        "username":     username,
-        "first_name":   first,
-        "update":       update,
-        "reply_text":   "Command executed.",
+def execute_handler(code: str, text: str, update: dict) -> str:
+    msg        = update.get("message", {})
+    chat_id    = msg.get("chat", {}).get("id", 0)
+    username   = msg.get("from", {}).get("username", "")
+    first_name = msg.get("from", {}).get("first_name", "there")
+    safe_builtins = {
+        "len": len, "str": str, "int": int, "float": float, "bool": bool,
+        "list": list, "dict": dict, "range": range, "round": round,
+        "min": min, "max": max, "abs": abs, "True": True, "False": False, "None": None,
     }
-    try:
-        exec(handler_code, {"__builtins__": {}}, local_vars)
-        return str(local_vars.get("reply_text", "Done."))
-    except Exception as e:
-        raise RuntimeError(f"Handler error: {e}")
+    local_vars = {
+        "user_message": text, "chat_id": chat_id, "username": username,
+        "first_name": first_name, "update": update, "reply_text": "Done.",
+    }
+    exec(code, {"__builtins__": safe_builtins}, local_vars)
+    return str(local_vars.get("reply_text", "Done."))
 
 
 def handle_update(token: str, update: dict) -> None:
-    """Process one Telegram update."""
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return
 
-    chat_id      = msg.get("chat", {}).get("id")
-    user_id      = msg.get("from", {}).get("id", 0)
-    username     = msg.get("from", {}).get("username", "")
-    text         = msg.get("text", "").strip()
+    chat_id    = msg.get("chat", {}).get("id")
+    user_id    = msg.get("from", {}).get("id", 0)
+    username   = msg.get("from", {}).get("username", "")
+    first_name = msg.get("from", {}).get("first_name", "there")
+    text       = msg.get("text", "").strip()
 
     if not chat_id or not text:
         return
 
-    # Extract command (e.g. /start or /start@BotName)
-    cmd_name = None
-    if text.startswith("/"):
-        parts    = text.split()
-        cmd_name = parts[0].split("@")[0].lower()
+    cmd_name = text.split()[0].split("@")[0].lower() if text.startswith("/") else None
 
-    # Fetch commands from PHP
-    commands = get_bot_commands(token)
+    bot_data      = php_get(f"/api/get-bot-commands.php?token={urllib.parse.quote(token)}")
+    commands      = bot_data.get("commands", [])
+    is_ai         = bot_data.get("is_ai_assistant", False)
+    ai_prompt     = bot_data.get("ai_system_prompt", "")
 
-    # Build a map: /command_name → handler info
     cmd_map = {}
-    is_ai_bot = False
-    ai_system_prompt = ""
     for c in commands:
-        if isinstance(c, dict):
-            cname = c.get("command_name", "").lower()
-            cmd_map[cname] = c
+        if isinstance(c, dict) and c.get("command_name"):
+            cmd_map[c["command_name"].lower()] = c
             if c.get("is_ai_assistant"):
-                is_ai_bot = True
-                ai_system_prompt = c.get("ai_system_prompt", "")
+                is_ai     = True
+                ai_prompt = c.get("ai_system_prompt", ai_prompt)
 
     reply = None
 
     if cmd_name and cmd_name in cmd_map:
-        cmd = cmd_map[cmd_name]
         try:
-            reply = execute_handler(cmd.get("handler_code", "reply_text = 'Hi!'"), text, update)
-        except RuntimeError as e:
-            reply = "Sorry, something went wrong with that command."
-            log_error(token, cmd_name, str(e), user_id)
+            reply = execute_handler(cmd_map[cmd_name].get("handler_code", "reply_text='Hi!'"), text, update)
+        except Exception as e:
+            reply = "⚠️ Command error. Please try again."
+            php_post("/api/log-error.php", {"token": token, "command_name": cmd_name, "error_message": str(e), "telegram_user_id": user_id})
 
-    elif is_ai_bot and text and not text.startswith("/"):
-        # AI assistant mode — pass message to AI via PHP
-        reply = call_ai(token, text, ai_system_prompt)
+    elif is_ai and not text.startswith("/"):
+        data  = php_post("/api/ai-chat.php", {"token": token, "message": text, "system_prompt": ai_prompt})
+        reply = data.get("reply", "AI unavailable.")
 
-    elif text == "/start":
-        reply = "👋 Hello! I'm up and running. Use /help to see available commands."
+    elif cmd_name == "/start" and "/start" not in cmd_map:
+        reply = f"👋 Hello {first_name}! I'm online. Send /help for available commands."
 
-    elif text == "/help":
+    elif cmd_name == "/help" and "/help" not in cmd_map:
         if cmd_map:
-            lines = ["*Available Commands:*\n"]
-            for name in cmd_map:
-                lines.append(f"`{name}`")
-            reply = "\n".join(lines)
+            reply = "*Available Commands:*\n" + "\n".join(f"`{n}`" for n in sorted(cmd_map))
         else:
             reply = "No commands configured for this bot yet."
 
     if reply:
-        res = telegram_send(token, chat_id, reply)
-        log_message(token, user_id, username, text, reply if (res.get("ok")) else "[send failed]")
+        res = tg_send(token, chat_id, reply)
+        php_post("/api/log-message.php", {
+            "token": token, "telegram_user_id": user_id, "username": username,
+            "message": text, "response": reply if res.get("ok") else "[send failed]",
+        })
 
 
-# ── Vercel Serverless Handler ─────────────────────────────────────────────────
+# ── Vercel Handler ────────────────────────────────────────────────────────────
 
 class handler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
-        pass  # Suppress default access logs on Vercel
+        pass
+
+    def cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def send_json(self, code: int, body: dict):
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        self.cors_headers()
         self.end_headers()
         self.wfile.write(payload)
 
-    def do_GET(self):
-        path = self.path.split("?")[0].rstrip("/")
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.cors_headers()
+        self.end_headers()
 
-        if path in ("/health", "/api/health"):
-            self.send_json(200, {
-                "status":   "ok",
-                "platform": "BotForge",
-                "php_host": PHP_HOST or "NOT SET",
-            })
+    def do_GET(self):
+        path  = self.path.split("?")[0].rstrip("/") or "/"
+        query = dict(urllib.parse.parse_qsl(self.path.split("?", 1)[1])) if "?" in self.path else {}
+
+        # Health
+        if path in ("/health", "/api/health", "/"):
+            self.send_json(200, {"status": "ok", "platform": "BotForge", "php_host": PHP_HOST or "NOT SET"})
             return
 
-        if path == "/":
-            self.send_json(200, {
-                "message":  "BotForge Webhook Backend",
-                "webhook":  "/webhook/{your_bot_token}",
-                "health":   "/health",
-            })
+        # ── Token validation fallback ─────────────────────────────────────────
+        # Browser JS calls this when PHP can't reach Telegram directly
+        if path == "/validate-token":
+            token = query.get("token", "").strip()
+            if not token:
+                self.send_json(400, {"ok": False, "error": "No token"})
+                return
+            if not re.match(r'^\d+:[A-Za-z0-9_-]{30,}$', token):
+                self.send_json(400, {"ok": False, "error": "Invalid token format"})
+                return
+            result = tg_get(token, "getMe")
+            if result.get("ok"):
+                self.send_json(200, {
+                    "ok":         True,
+                    "username":   result["result"].get("username", ""),
+                    "first_name": result["result"].get("first_name", ""),
+                    "bot_id":     result["result"].get("id", 0),
+                    "source":     "vercel",
+                })
+            else:
+                self.send_json(200, {"ok": False, "error": result.get("description", "Invalid token")})
             return
 
         self.send_json(404, {"error": "Not found"})
@@ -251,28 +216,22 @@ class handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0].rstrip("/")
 
-        # ── Telegram Webhook ──────────────────────────────────────────────────
+        # Webhook
         if path.startswith("/webhook/"):
             token = path[len("/webhook/"):]
             if not token:
                 self.send_json(400, {"error": "Missing token"})
                 return
-
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                body   = self.rfile.read(length)
-                update = json.loads(body)
+                update = json.loads(self.rfile.read(length))
             except Exception as e:
-                self.send_json(400, {"error": f"Bad JSON: {e}"})
+                self.send_json(400, {"error": str(e)})
                 return
-
             try:
                 handle_update(token, update)
             except Exception:
-                # Never let exceptions break the 200 response to Telegram
                 pass
-
-            # Telegram requires a 200 response, always
             self.send_json(200, {"ok": True})
             return
 
